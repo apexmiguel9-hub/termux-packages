@@ -44,3 +44,20 @@ termux_step_strip_elf_symbols() {
 		\( ! -path "./libexec/installed-tests/termux-core/*" \) \
 	\)
 }
+
+# FORK PATCH: upstream termux/termux-core hardcodes /data/data/com.termux rather than deriving
+# from $TERMUX_PREFIX, so a fork with a different applicationId ships binaries
+# whose paths point into Termux's own data dir. Measured on our own build of this
+# package: 1 residual /data/data/com.termux strings across 1 files under
+# $PREFIX/bin (including cache/apt/archives and cache/apt/pkgcache.bin).
+#
+# Not fixable upstream in termux-packages: build.sh only downloads the tarball,
+# the literals live in the termux/termux-core repository.
+termux_step_post_make_install() {
+	local _f
+	for _f in "$TERMUX_PREFIX"/bin/*; do
+		[ -f "$_f" ] || continue
+		grep -q "/data/data/com.termux" "$_f" 2>/dev/null || continue
+		sed -i "s|/data/data/com\.termux|$TERMUX_APP__DATA_DIR|g" "$_f"
+	done
+}
