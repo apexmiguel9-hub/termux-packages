@@ -27,6 +27,21 @@ termux_step_pre_configure() {
 
 termux_step_post_make_install() {
 	TERMUX_PKG_CONFFILES="$(cat "$TERMUX_PKG_BUILDDIR/conffiles")"
+
+	# FORK PATCH: upstream hardcodes /data/data/com.termux rather than deriving
+	# from $TERMUX_PREFIX, so a fork with a different applicationId ships a `pkg`
+	# whose apt cache and mirror paths point into Termux's own data dir.
+	# Measured on our own build: 21 residual refs across 19 files under
+	# $PREFIX/bin, including cache/apt/archives and cache/apt/pkgcache.bin. This
+	# is what makes `pkg update` fail with "None of the mirrors are accessible".
+	# Not fixable in termux-packages: build.sh only downloads the tarball from
+	# github.com/termux/termux-tools, the literals live there.
+	local _f
+	for _f in "$TERMUX_PREFIX"/bin/*; do
+		[ -f "$_f" ] || continue
+		grep -q "/data/data/com.termux" "$_f" 2>/dev/null || continue
+		sed -i "s|/data/data/com\.termux|$TERMUX_APP__DATA_DIR|g" "$_f"
+	done
 }
 
 termux_step_create_debscripts() {
