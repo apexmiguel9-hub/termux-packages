@@ -123,8 +123,16 @@ jobs:
           for p in $SEEDS; do
             d="packages/$p"
             if [ ! -d "$d" ]; then echo "WARN: missing $d"; continue; fi
-            TERMUX_ARCH=${{ inputs.arch }} python3 scripts/buildorder.py "$d" \
-              | awk '{print $1}' >> ordered.txt
+            # buildorder.py emits only the transitive DEPENDENCIES of a
+            # package, never the package itself. Without the explicit echo the
+            # seed list was silently dropped: apt, nano, ed, patch, unzip,
+            # lsof, net-tools, dos2unix, inetutils, debianutils and
+            # command-not-found were never built, i.e. no apt in the bootstrap.
+            {
+              TERMUX_ARCH=${{ inputs.arch }} python3 scripts/buildorder.py "$d" \
+                | awk '{print $1}'
+              echo "$p"
+            } >> ordered.txt
           done
           awk 'NF && !seen[$0]++' ordered.txt > ordered.final.txt
           mv ordered.final.txt ordered.txt
