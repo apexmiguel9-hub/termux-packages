@@ -85,7 +85,8 @@ jobs:
     name: Compile bootstrap closure (${{ inputs.arch }})
     if: ${{ !inputs.audit_only }}
     needs: audit
-    runs-on: ubuntu-slim
+    # NOT ubuntu-slim: the slim runners have no docker daemon.
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     env:
       TERMUX_BUILDER_IMAGE_NAME: tessl/package-builder:latest
@@ -93,9 +94,21 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 1 }
 
+      - name: Restore package builder image cache
+        id: imgcache
+        uses: actions/cache@v4
+        with:
+          path: tessl-builder-image.tar
+          key: builder-image-v1
+
+      - name: Load cached package builder image
+        if: steps.imgcache.outputs.cache-hit == 'true'
+        run: docker load -i tessl-builder-image.tar
+
       - name: Build the package builder image
         run: |
           docker build -t tessl/package-builder:latest scripts/
+          docker save tessl/package-builder:latest | gzip > tessl-builder-image.tar
           docker buildx prune -af
 
       - name: Resolve build order for the bootstrap closure
