@@ -1,0 +1,143 @@
+name: Tessl bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: Target architecture
+        type: choice
+        options: [aarch64, arm, i686, x86_64]
+        default: aarch64
+      build_seed:
+        description: Compile seed packages from source with our TERMUX_PREFIX
+        type: boolean
+        default: true
+
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Allow cross-repo dependency downloads: keep TERMUX_REPO_APP__PACKAGE_NAME
+  # at "com.termux" so prebuilt deps are fetched, not rebuilt.
+  TESSL_FORK_ALLOW_CROSS_REPO_DEPS: "true"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Job 1: smoke test. Repacks upstream .debs into a bootstrap zip.
+  # This COMPILES NOTHING - it only proves the pipeline runs.
+  # Paths inside will still be /data/data/com.termux/...
+  # ---------------------------------------------------------------------
+  repack-smoke:
+    name: Repack smoke test (${{ inputs.arch }})
+    runs-on: ubuntu-slim
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify our prefix is in effect
+        run: |
+          . scripts/properties.sh
+          echo "APP_PACKAGE=$TERMUX_APP__PACKAGE_NAME"
+          echo "DATA_DIR=$TERMUX_APP__DATA_DIR"
+          echo "PREFIX=$TERMUX__PREFIX"
+          echo "REPO_PKG=$TERMUX_REPO_APP__PACKAGE_NAME"
+          echo "--- length guard (limit 90 incl NUL) ---"
+          echo -n "$TERMUX__PREFIX" | wc -c
+
+      - name: Repack bootstrap from upstream debs
+        run: ./scripts/generate-bootstraps.sh --architectures "${{ inputs.arch }}"
+
+      - name: Show artifact
+        run: |
+          ls -lh *.zip
+          unzip -l bootstrap-${{ inputs.arch }}.zip | tail -5
+          unzip -p bootstrap-${{ inputs.arch }}.zip etc/profile 2>/dev/null | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-repack-${{ inputs.arch }}
+          path: "*.zip"
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Job 2: the real thing. Compile the 32 bootstrap seed packages from
+  # source so the resulting binaries have OUR prefix baked in.
+  # ---------------------------------------------------------------------
+  build-seed:
+    name: Compile seed packages (${{ inputs.arch }})
+    if: ${{ inputs.build_seed }}
+    needs: repack-smoke
+    runs-on: ubuntu-slim
+    timeout-minutes: 360
+    env:
+      TERMUX_BUILDER_IMAGE_NAME: tessl/package-builder:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build the package builder image
+        run: |
+          docker build -t tessl/package-builder:latest scripts/
+          docker buildx prune -af
+
+      - name: Generate seed package list
+        id: seeds
+        run: |
+          set -euo pipefail
+          . scripts/properties.sh
+          # Seed list extracted from scripts/generate-bootstraps.sh pull_package calls
+          PKGS="bash bzip2 command-not-found coreutils curl dash debianutils diffutils \
+          dos2unix ed findutils gawk grep gzip inetutils less lsof nano net-tools patch \
+          procps proot psmisc sed tar termux-core termux-exec termux-keyring \
+          termux-tools unzip util-linux xz-utils apt"
+          echo "$PKGS" | tr ' ' '\n' | grep -v '^$' > seed-packages.txt
+          echo "count=$(wc -l < seed-packages.txt)"
+          cat seed-packages.txt
+
+      - name: Resolve build order
+        run: |
+          set -euo pipefail
+          python3 scripts/buildorder.py seed-packages.txt > build-order.txt || \
+            cp seed-packages.txt build-order.txt
+          cat build-order.txt
+
+      - name: Compile
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          ./scripts/run-docker.sh -d ./build-package.sh -I -C \
+            -a "${{ inputs.arch }}" $(cat build-order.txt)
+
+      - name: Collect built packages
+        run: |
+          mkdir -p out
+          find . -name '*.deb' -newermt '-8 hours' -exec cp {} out/ \; 2>/dev/null || true
+          find . -name '*.pkg.tar.xz' -newermt '-8 hours' -exec cp {} out/ \; 2>/dev/null || true
+          ls -lh out/ | head -50
+          echo "built=$(ls out/ 2>/dev/null | wc -l)"
+
+      - name: Prove the prefix got baked in
+        run: |
+          set -euo pipefail
+          . scripts/properties.sh
+          echo "Expecting prefix: $TERMUX__PREFIX"
+          BIN=$(find out -name 'coreutils_*.deb' | head -1)
+          if [ -z "$BIN" ]; then echo "no coreutils deb found"; exit 1; fi
+          rm -rf x && mkdir x && dpkg-deb -x "$BIN" x
+          echo "--- strings in /bin/cat matching com.termux ---"
+          strings x/bin/cat | grep -c 'com\.termux' || true
+          echo "--- strings matching our package ---"
+          strings x/bin/cat | grep -c 'apexmiguel9' || true
+          echo "--- sample ---"
+          strings x/bin/cat | grep -E 'com\.termux|apexmiguel9' | head -5 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessl-packages-${{ inputs.arch }}
+          path: out/
+          retention-days: 14

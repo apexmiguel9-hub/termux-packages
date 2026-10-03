@@ -630,9 +630,18 @@ unset -f _show_usage
 
 # Dependencies should be used from repo only if they are built for
 # same package name.
-if [[ "$TERMUX_REPO_APP__PACKAGE_NAME" != "$TERMUX_APP_PACKAGE" ]]; then
-	echo "Ignoring -i option to download dependencies since repo package name ($TERMUX_REPO_APP__PACKAGE_NAME) does not equal app package name ($TERMUX_APP_PACKAGE)"
-	TERMUX_INSTALL_DEPS=false
+#
+# FORK PATCH: disabled. We intentionally keep TERMUX_REPO_APP__PACKAGE_NAME
+# pointing at "com.termux" so that prebuilt dependencies can still be
+# DOWNLOADED from the upstream repo, while the packages listed in
+# BOOTSTRAP_SEED_PACKAGES are COMPILED locally with our own TERMUX__PREFIX.
+# Without this, all 1144 packages referencing TERMUX_PREFIX would be built
+# from source instead of being fetched.
+if [[ "${TESSL_FORK_ALLOW_CROSS_REPO_DEPS:-false}" == "true" ]]; then
+	if [[ "$TERMUX_REPO_APP__PACKAGE_NAME" != "$TERMUX_APP_PACKAGE" ]]; then
+		echo "Ignoring -i option to download dependencies since repo package name ($TERMUX_REPO_APP__PACKAGE_NAME) does not equal app package name ($TERMUX_APP_PACKAGE)"
+		TERMUX_INSTALL_DEPS=false
+	fi
 fi
 
 case "$TERMUX_REPO_PKG_FORMAT" in
