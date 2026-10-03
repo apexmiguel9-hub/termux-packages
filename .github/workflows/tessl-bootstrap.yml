@@ -144,7 +144,6 @@ jobs:
           find / -name '*.deb' -path '*termux*' -newermt '-8 hours' -exec cp -n {} out/ \; 2>/dev/null || true
           ls -lh out/ | head -60
           echo "built=$(ls out/ 2>/dev/null | wc -l) / expected=$(wc -l < ordered.txt)"
-
       - name: Verify our prefix is baked into the binaries
         run: |
           set -euo pipefail
@@ -167,8 +166,24 @@ jobs:
           echo "---"
           if [ "$FAIL" -eq 0 ]; then echo "PASS: our prefix is baked in."; else echo "FAIL"; exit 1; fi
 
+      - name: Pack debs
+        run: |
+          # GitHub's artifact uploader rejects ':' in filenames (NTFS limitation)
+          # and termux versions use epochs like 1:2026.09.25. Tar it instead.
+          mkdir -p staged
+          i=0
+          for f in out/*.deb; do
+            [ -e "$f" ] || continue
+            i=$((i+1))
+            safe=$(basename "$f" | tr ':' '-')
+            cp "$f" "staged/$safe"
+          done
+          tar -czf "tessl-packages-${{ inputs.arch }}.tar.gz" -C staged .
+          ls -lh "tessl-packages-${{ inputs.arch }}.tar.gz"
+          echo "packed=$i debs"
+
       - uses: actions/upload-artifact@v4
         with:
           name: tessl-packages-${{ inputs.arch }}
-          path: out/
+          path: tessl-packages-${{ inputs.arch }}.tar.gz
           retention-days: 14
