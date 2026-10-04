@@ -2180,8 +2180,15 @@ TERMUX_AM_APP__AM_CLASS__CLASS_NAME="$TERMUX_AM_APP__NAMESPACE.Am"
 # and are compiled locally.
 # FIXME: Checking for all variables will be added later in repo
 # changes pull, currently only `TERMUX_REPO_APP__PACKAGE_NAME` is checked.
-TERMUX_REPO_APP__PACKAGE_NAME="com.termux"
-TERMUX_REPO_APP__DATA_DIR="/data/data/com.termux"
+# FORK PATCH (bootstrap propio): el repo ahora se construye para nuestro propio
+# package, asi que el nombre del repo y el data dir se derivan de el en vez de
+# apuntar al de Termux. Con esto `TERMUX_REPO_APP__PACKAGE_NAME` ==
+# `TERMUX_APP__PACKAGE_NAME`, que es la condicion que build-package.sh exige
+# para permitir descargar dependencias precompiladas. En nuestro flujo NUNCA
+# se usa -i/-I (el bootstrap se compila entero desde fuente), asi que el repo
+# propio todavia no necesita existir.
+TERMUX_REPO_APP__PACKAGE_NAME="$TERMUX_APP__PACKAGE_NAME"
+TERMUX_REPO_APP__DATA_DIR="/data/data/$TERMUX_REPO_APP__PACKAGE_NAME"
 TERMUX_REPO__CORE_DIR="/data/data/com.termux/termux/core"
 TERMUX_REPO__APPS_DIR="/data/data/com.termux/termux/app"
 TERMUX_REPO__ROOTFS="/data/data/com.termux/files"

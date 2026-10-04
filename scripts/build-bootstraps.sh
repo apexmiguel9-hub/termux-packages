@@ -29,9 +29,15 @@ BOOTSTRAP_ANDROID10_COMPATIBLE=false
 TERMUX_DEFAULT_ARCHITECTURES=("aarch64" "arm" "i686" "x86_64")
 TERMUX_ARCHITECTURES=("${TERMUX_DEFAULT_ARCHITECTURES[@]}")
 
-TERMUX_PACKAGES_DIRECTORY="/home/builder/termux-packages"
-TERMUX_BUILT_DEBS_DIRECTORY="$TERMUX_PACKAGES_DIRECTORY/output"
-TERMUX_BUILT_PACKAGES_DIRECTORY="/data/data/.built-packages"
+# FORK PATCH (bootstrap propio): estas rutas estaban fijas a las del contenedor
+# de build, lo que impedia ejecutarlo fuera de /home/builder y desde CI, donde el
+# repo vive en otro sitio y los .deb se dejan en ./output. Con ${VAR:=default}
+# se pueden inyectar por entorno y los valores por defecto siguen siendo los
+# del docker builder.
+: "${TERMUX_PACKAGES_DIRECTORY:=/home/builder/termux-packages}"
+: "${TERMUX_BUILT_DEBS_DIRECTORY:=$TERMUX_PACKAGES_DIRECTORY/output}"
+: "${TERMUX_BUILT_PACKAGES_DIRECTORY:=/data/data/.built-packages}"
+TERMUX_PACKAGES_DIRECTORY=$(realpath "$TERMUX_PACKAGES_DIRECTORY")
 
 IGNORE_BUILD_SCRIPT_NOT_FOUND_ERROR=1
 FORCE_BUILD_PACKAGES=0
@@ -227,6 +233,86 @@ add_termux_bootstrap_second_stage_files() {
 		> "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 	chmod 600 "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 
+}
+
+# FORK PATCH (bootstrap propio): gate de validacion. Un bootstrap cuyo ELF
+# conserve /data/data/com.termux en .rodata no es reparable en el movil (el
+# string es de ancho fijo y el prefijo de la app es mas largo), asi que en
+# lugar de empaquetarlo y que falle en tiempo de ejecucion, se aborta aqui.
+# Se comprueba el CONTENIDO, no solo los scripts: el bug original estaba
+# justamente en strings de ELF (.rodata), no en los ficheros de texto.
+validate_bootstrap_rootfs() {
+	local arch="$1"
+	local root="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
+	local bad_files=0
+	local hits_file
+
+	echo $'\n\n\n'"[*] Validating '$root' (arch='$arch')'..."
+
+	# 1) Ningun ELF ni script puede contener la ruta del runtime de Termux.
+	#    strings solo sobre ELF; los ficheros de texto se buscan aparte.
+	hits_file="${BOOTSTRAP_TMPDIR}/stock-refs-${arch}.txt"
+	: > "$hits_file"
+	local f
+	while IFS= read -r -d '' f; do
+		if head -c 4 "$f" 2>/dev/null | grep -q $'\x7fELF'; then
+			strings -a "$f" 2>/dev/null | grep -q '/data/data/com\.termux' \
+				&& echo "ELF   $f" >> "$hits_file"
+		else
+			grep -lI '/data/data/com\.termux' "$f" 2>/dev/null >> "$hits_file" \
+				|| true
+		fi
+	done < <(find "$root" -type f -print0)
+
+	# grep -c imprime "0" Y sale con codigo 1 cuando no hay coincidencias, asi
+	# que un `|| echo 0` anadiria un segundo 0 y la comparacion siguiente
+	# recibiria "0\n0", fallando en silencio: el gate pasaria siempre. Con
+	# `|| true` se conserva el 0 que grep ya imprimio.
+	bad_files=$(grep -c . "$hits_file" 2>/dev/null || true)
+	bad_files=${bad_files:-0}
+	if [ "$bad_files" -gt 0 ] 2>/dev/null; then
+		echo "[!] FAIL: $bad_files file(s) still reference /data/data/com.termux"
+		echo "[!] first offenders:"
+		grep -m 25 . "$hits_file" | sed 's/^/      /'
+		echo "[!] the full list is in $hits_file"
+		return 1
+	fi
+	echo "[*] OK: no file references /data/data/com.termux"
+
+	# 2) El prefijo propio debe estar presente en los binarios criticos. Sin
+	#    esto, un cierre vacio o todo stock passesarian el punto 1.
+	local missing=0 t
+	for t in bin/bash bin/sh bin/dpkg bin/apt bin/curl bin/tar \
+	         bin/gzip bin/gpg bin/gpgv bin/openssl; do
+		if [ -e "$root/$t" ]; then
+			if ! strings -a "$root/$t" 2>/dev/null | grep -q "$TERMUX_PREFIX"; then
+				echo "[!] WARN: $t does not carry $TERMUX_PREFIX"
+				missing=$((missing+1))
+			fi
+		fi
+	done
+	if [ "$missing" -gt 0 ]; then
+		echo "[!] FAIL: $missing critical binary/binaries lack our prefix"
+		return 1
+	fi
+	echo "[*] OK: critical binaries carry $TERMUX_PREFIX"
+
+	# 3) Estructura de directorios que dpkg/apt/ncurses necesitan en tiempo de
+	#    ejecucion y que el simple unzip del APK no crea.
+	local d
+	for d in etc/apt/apt.conf.d etc/apt/preferences.d etc/dpkg \
+	         var/lib/dpkg var/lib/dpkg/info var/lib/dpkg/updates var/log/apt; do
+		if [ ! -d "$root/$d" ]; then
+			echo "[!] FAIL: missing runtime directory $d"
+			return 1
+		fi
+	done
+	if [ ! -f "$root/etc/tls/cert.pem" ] && [ ! -f "$root/etc/tls/ca-certificates.crt" ]; then
+		echo "[!] FAIL: no CA bundle in etc/tls"
+		return 1
+	fi
+	echo "[*] OK: runtime directory layout present"
+	return 0
 }
 
 # Final stage: generate bootstrap archive and place it to current
@@ -484,6 +570,11 @@ main() {
 
 		# Add termux bootstrap second stage files
 		add_termux_bootstrap_second_stage_files "$package_arch"
+
+		# FORK PATCH (bootstrap propio): no empaquetar un bootstrap con rutas
+		# del runtime de Termux incrustadas en ELF. Abortar aqui y no en el
+		# movil.
+		validate_bootstrap_rootfs "$TERMUX_ARCH" || return $?
 
 		# Create bootstrap archive.
 		create_bootstrap_archive "$TERMUX_ARCH" || return $?

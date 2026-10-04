@@ -22,6 +22,7 @@ env:
   # Fork patch: keep TERMUX_REPO_APP__PACKAGE_NAME at com.termux so prebuilt
   # non-bootstrap deps can still be fetched instead of rebuilt.
   TESSL_FORK_ALLOW_CROSS_REPO_DEPS: "true"
+  ARCH: ${{ inputs.arch }}
 
 jobs:
   # ---------------------------------------------------------------------
@@ -43,6 +44,7 @@ jobs:
           {
             echo "OUR_PACKAGE=$TERMUX_APP__PACKAGE_NAME"
             echo "OUR_PREFIX=$TERMUX__PREFIX"
+            echo "OUR_DATA_DIR=$TERMUX_APP__DATA_DIR"
             echo "REPO_PACKAGE=$TERMUX_REPO_APP__PACKAGE_NAME"
           } | tee prefix.env
 
@@ -50,39 +52,48 @@ jobs:
         run: |
           set -euo pipefail
           . prefix.env
-          curl -sL "https://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-${{ inputs.arch }}/Packages.gz" | gunzip > pkgs.txt
-          F=$(awk '/^Package: coreutils$/,/^$/' pkgs.txt | grep -m1 '^Filename:' | awk '{print $2}')
+          curl -sL "https://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-$ARCH/Packages.gz" | gunzip > pkgs.txt
+          F=$(awk '/^Package: dpkg$/,/^$/' pkgs.txt | grep -m1 '^Filename:' | awk '{print $2}')
           echo "deb: $F"
-          curl -sL -o coreutils.deb "https://packages-cf.termux.dev/apt/termux-main/$F"
-          rm -rf ex && mkdir ex && dpkg-deb -x coreutils.deb ex
+          curl -sL -o dpkg.deb "https://packages-cf.termux.dev/apt/termux-main/$F"
+          rm -rf ex && mkdir ex && dpkg-deb -x dpkg.deb ex
 
       - name: Report the mismatch
         run: |
           set -euo pipefail
           . prefix.env
+          BIN=$(find ex -type f -path '*bin/dpkg' | head -1)
           echo "=== archive layout (upstream) ==="
-          find ex -type f -name cat | head -3
+          find ex -type f -path '*bin/dpkg'
           echo
           echo "=== ELF strings (upstream) ==="
-          strings "$(find ex -type f -name cat | head -1)" | grep -oE '/data/data/[a-z0-9.]+' | sort -u
+          strings "$BIN" | grep -oE '/data/data/[a-z0-9.]+' | sort -u
           echo
           echo "=== conclusion ==="
           echo "upstream binaries hardcode /data/data/com.termux -> repack cannot work."
-          echo "We must COMPILE the seed closure with our own prefix."
-          if strings "$(find ex -type f -name cat | head -1)" | grep -q 'com\.termux'; then
+          echo "We must COMPILE the closure with our own prefix."
+          if strings "$BIN" | grep -q 'com\.termux'; then
             echo "CONFIRMED: com.termux is baked into the binaries."
+          else
+            echo "UNEXPECTED: no com.termux found; upstream may have changed."
           fi
 
   # ---------------------------------------------------------------------
-  # The real build: compile the full bootstrap closure (86 packages) with
-  # TERMUX_PREFIX=/data/data/io.github.apexmiguel9.termux/files/usr
+  # The real build. ONE run-docker.sh invocation so that the
+  # /data/data/.built-packages markers inside the container survive between
+  # the package compile and the bootstrap assembly; otherwise every package
+  # would be compiled twice.
   #
-  # NOTE: no -I flag here. -I downloads prebuilt deps from the upstream repo,
-  # which would give us com.termux-prefixed .so files linked into our
-  # binaries. Every package in the closure must be built locally.
+  # scripts/build-bootstraps.sh does the whole chain:
+  #   build-package.sh per package -> extract .deb -> second stage files
+  #   -> validate_bootstrap_rootfs (ABORTS on any com.termux in ELF)
+  #   -> bootstrap-<arch>.zip with SYMLINKS.txt
+  #
+  # No -i flag anywhere: dependencies are compiled locally, never downloaded,
+  # so no upstream .so can leak in with com.termux inside it.
   # ---------------------------------------------------------------------
-  build-seed:
-    name: Compile bootstrap closure (${{ inputs.arch }})
+  build-bootstrap:
+    name: Compile closure + build bootstrap zip (${{ inputs.arch }})
     if: ${{ !inputs.audit_only }}
     needs: audit
     # NOT ubuntu-slim: the slim runners have no docker daemon.
@@ -111,55 +122,42 @@ jobs:
           docker save tessl/package-builder:latest | gzip > tessl-builder-image.tar
           docker buildx prune -af
 
-      - name: Resolve build order for the bootstrap closure
-        id: order
+      - name: Show the prefix we are building for
         run: |
-          set -euo pipefail
-          SEEDS="bash bzip2 command-not-found coreutils curl dash debianutils diffutils
-                 dos2unix ed findutils gawk grep gzip inetutils less lsof nano net-tools
-                 patch procps proot psmisc sed tar termux-core termux-exec
-                 termux-keyring termux-tools unzip util-linux xz-utils apt"
-          : > ordered.txt
-          for p in $SEEDS; do
-            d="packages/$p"
-            if [ ! -d "$d" ]; then echo "WARN: missing $d"; continue; fi
-            # buildorder.py emits only the transitive DEPENDENCIES of a
-            # package, never the package itself. Without the explicit echo the
-            # seed list was silently dropped: apt, nano, ed, patch, unzip,
-            # lsof, net-tools, dos2unix, inetutils, debianutils and
-            # command-not-found were never built, i.e. no apt in the bootstrap.
-            {
-              TERMUX_ARCH=${{ inputs.arch }} python3 scripts/buildorder.py "$d" \
-                | awk '{print $1}'
-              echo "$p"
-            } >> ordered.txt
-          done
-          awk 'NF && !seen[$0]++' ordered.txt > ordered.final.txt
-          mv ordered.final.txt ordered.txt
-          echo "packages=$(wc -l < ordered.txt)"
-          cat ordered.txt
+          . scripts/properties.sh
+          {
+            echo "OUR_PACKAGE=$TERMUX_APP__PACKAGE_NAME"
+            echo "OUR_PREFIX=$TERMUX__PREFIX"
+            echo "OUR_DATA_DIR=$TERMUX_APP__DATA_DIR"
+            echo "PREFIX_LEN=${#TERMUX__PREFIX}"
+          } | tee prefix.env
+          cat prefix.env
 
-      - name: Compile
+      - name: Compile closure and assemble bootstrap zip
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2046
-          ./scripts/run-docker.sh -d ./build-package.sh -C \
-            -a "${{ inputs.arch }}" $(cat ordered.txt)
+          # ca-certificates + openssl: sin ellos 'pkg update' no tiene TLS y
+          # falla con 'None of the mirrors are accessible'. proot, python y git
+          # se anaden porque el runtime los usa.
+          ./scripts/run-docker.sh -d ./scripts/build-bootstraps.sh \
+            --architectures "$ARCH" \
+            --add ca-certificates,openssl,proot,python,git 2>&1 | tee bootstrap-build.log
+          ls -lh bootstrap-*.zip
 
       - name: Collect built packages
         run: |
           mkdir -p out
           find / -name '*.deb' -path '*termux*' -newermt '-8 hours' -exec cp -n {} out/ \; 2>/dev/null || true
-          ls -lh out/ | head -60
-          echo "built=$(ls out/ 2>/dev/null | wc -l) / expected=$(wc -l < ordered.txt)"
-      - name: Verify our prefix is baked into the binaries
+          echo "debs=$(ls out/ 2>/dev/null | wc -l)"
+          ls -lh out/ | head -40
+
+      - name: Verify our prefix is baked into the compiled debs
         run: |
           set -euo pipefail
           . scripts/properties.sh
-          echo "expecting: $TERMUX__PREFIX"
           rm -rf verify && mkdir verify
           FAIL=0
-          for pkg in coreutils bash grep tar sed curl; do
+          for pkg in bash sh dpkg apt curl tar gzip coreutils; do
             DEB=$(ls out/${pkg}_*.deb 2>/dev/null | head -1 || true)
             if [ -z "$DEB" ]; then echo "MISSING deb: $pkg"; FAIL=1; continue; fi
             rm -rf verify/$pkg && mkdir -p verify/$pkg
@@ -168,30 +166,98 @@ jobs:
             [ -z "$BIN" ] && { echo "no binary in $pkg"; continue; }
             OURS=$(strings "$BIN" | grep -c 'apexmiguel9' || true)
             THEIRS=$(strings "$BIN" | grep -c 'com\.termux' || true)
-            printf "%-12s ours=%-4s theirs=%-4s %s\n" "$pkg" "$OURS" "$THEIRS" "$(basename $BIN)"
+            printf "%-12s ours=%-4s theirs=%-4s %s\n" "$pkg" "$OURS" "$THEIRS" "$(basename "$BIN")"
             [ "$OURS" -eq 0 ] && FAIL=1
+            [ "$THEIRS" -ne 0 ] && FAIL=1
           done
           echo "---"
-          if [ "$FAIL" -eq 0 ]; then echo "PASS: our prefix is baked in."; else echo "FAIL"; exit 1; fi
+          if [ "$FAIL" -eq 0 ]; then echo "PASS: our prefix is baked in, zero com.termux"; else echo "FAIL"; exit 1; fi
 
-      - name: Pack debs
+      # -------------------------------------------------------------------
+      # Independent gate on the ZIP itself. Does not trust the build job:
+      # re-extracts and inspects what would actually ship.
+      # -------------------------------------------------------------------
+      - name: Inspect the bootstrap zip
+        run: |
+          set -euo pipefail
+          . scripts/properties.sh
+          ZIP="bootstrap-$ARCH.zip"
+          test -f "$ZIP" || { echo "no $ZIP"; exit 1; }
+          echo "zip: $ZIP  ($(stat -c %s "$ZIP") bytes)"
+
+          rm -rf z && mkdir z && unzip -q "$ZIP" -d z
+          echo "entradas: $(find z -type f | wc -l)"
+          test -f z/SYMLINKS.txt && echo "SYMLINKS.txt: $(wc -l < z/SYMLINKS.txt) lineas"
+
+          echo
+          echo "=== 1) busca /data/data/com.termux en TODOS los ficheros ==="
+          HITS=0
+          while IFS= read -r -d '' f; do
+            if head -c 4 "$f" | grep -q $'\x7fELF'; then
+              if strings -a "$f" | grep -q '/data/data/com\.termux'; then
+                echo "  ELF   ${f#z/}"; HITS=$((HITS+1))
+              fi
+            elif grep -lI '/data/data/com\.termux' "$f" 2>/dev/null; then
+              echo "  TEXT  ${f#z/}"; HITS=$((HITS+1))
+            fi
+          done < <(find z -type f -print0)
+          echo "  offenders: $HITS"
+          if [ "$HITS" -ne 0 ]; then echo "FAIL: el zip contiene rutas de com.termux"; exit 1; fi
+          echo "  OK: 0 referencias a com.termux"
+
+          echo
+          echo "=== 2) nuestro prefijo debe estar presente en los binarios criticos ==="
+          MISS=0
+          for t in bash sh dpkg apt apt-get curl tar gzip clear; do
+            F=$(find z -type f -path "*/bin/$t" | head -1)
+            if [ -z "$F" ]; then printf '  %-8s AUSENTE\n' "$t"; continue; fi
+            O=$(strings -a "$F" | grep -c 'apexmiguel9' || true)
+            printf '  %-8s ours=%-4s %s\n' "$t" "$O" "${F#z/}"
+            [ "$O" -eq 0 ] && MISS=$((MISS+1))
+          done
+          if [ "$MISS" -ne 0 ]; then echo "FAIL: $MISS binarios sin nuestro prefijo"; exit 1; fi
+
+          echo
+          echo "=== 3) estructura de runtime ==="
+          for d in etc/apt/apt.conf.d etc/apt/preferences.d etc/dpkg \
+                   var/lib/dpkg var/lib/dpkg/info etc/tls; do
+            if [ -e "z/$d" ]; then printf '  OK      %s\n' "$d"
+            else printf '  FALTA   %s\n' "$d"; MISS=$((MISS+1)); fi
+          done
+          for f in etc/tls/cert.pem etc/profile etc/apt/sources.list bin/bash bin/dpkg bin/pkg; do
+            if [ -e "z/$f" ]; then printf '  OK      %s\n' "$f"
+            else printf '  FALTA   %s\n' "$f"; MISS=$((MISS+1)); fi
+          done
+          [ "$MISS" -ne 0 ] && { echo "FAIL: faltan $MISS ficheros/directorios"; exit 1; }
+
+          echo
+          echo "=== 4) openssl y CA (de esto depende 'pkg update') ==="
+          for t in openssl gpg gpgv ca-certificates; do
+            F=$(find z -type f -path "*/bin/$t" | head -1)
+            [ -z "$F" ] && F=$(find z -type d -path "*/etc/tls/$t.crt" | head -1)
+            printf '  %-18s %s\n' "$t" "${F:-AUSENTE}"
+          done
+
+      - name: Pack artifact
         run: |
           # GitHub's artifact uploader rejects ':' in filenames (NTFS limitation)
           # and termux versions use epochs like 1:2026.09.25. Tar it instead.
-          mkdir -p staged
+          mkdir -p staged/debs
           i=0
           for f in out/*.deb; do
             [ -e "$f" ] || continue
             i=$((i+1))
             safe=$(basename "$f" | tr ':' '-')
-            cp "$f" "staged/$safe"
+            cp "$f" "staged/debs/$safe"
           done
-          tar -czf "tessl-packages-${{ inputs.arch }}.tar.gz" -C staged .
-          ls -lh "tessl-packages-${{ inputs.arch }}.tar.gz"
-          echo "packed=$i debs"
+          cp "bootstrap-$ARCH.zip" staged/
+          cp bootstrap-build.log staged/ 2>/dev/null || true
+          tar -czf "apex-bootstrap-$ARCH.tar.gz" -C staged .
+          ls -lh "apex-bootstrap-$ARCH.tar.gz"
+          echo "packed=$i debs + zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tessl-packages-${{ inputs.arch }}
-          path: tessl-packages-${{ inputs.arch }}.tar.gz
-          retention-days: 14
+          name: apex-bootstrap-${{ inputs.arch }}
+          path: apex-bootstrap-${{ inputs.arch }}.tar.gz
+          retention-days: 30
