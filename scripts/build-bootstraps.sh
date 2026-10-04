@@ -64,6 +64,37 @@ for cmd in ar awk curl grep gzip find sed tar xargs xz zip; do
 	fi
 done
 
+# FORK PATCH (bootstrap propio): resuelve un nombre de paquete al directorio
+# de fuentes que hay que compilar.
+#
+# El script upstream nunca necesita esto porque descarga .deb ya compilados
+# del repo. Aqui compilamos desde fuente, y 305 paquetes del repo son
+# SUBpaquetes: no tienen directorio propio, se declaran como
+# packages/<padre>/<nombre>.subpackage.sh y los produce build-package.sh al
+# compilar el padre. El caso que rompe el bootstrap es 'bzip2', que es un
+# subpaquete de 'libbz2':
+#
+#   ERROR: No package bzip2 found in any of the enabled repositories.
+#
+# que es exactamente lo que fallo el run 37216882019.
+#
+# Se imprime el nombre del paquete a compilar por stdout, para no contaminar
+# la salida de build-package.sh que se captura en build_package().
+resolve_package_dir() {
+	local name="$1"
+	if [ -d "$TERMUX_PACKAGES_DIRECTORY/packages/$name" ]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+	local candidate
+	for candidate in "$TERMUX_PACKAGES_DIRECTORY"/packages/*/"$name.subpackage.sh"; do
+		[ -e "$candidate" ] || continue
+		printf '%s\n' "$(basename "$(dirname "$candidate")")"
+		return 0
+	done
+	return 1
+}
+
 # Build deb files for package and its dependencies deb from source for arch
 build_package() {
 
@@ -73,13 +104,24 @@ build_package() {
 	local package_name="$2"
 
 	local build_output
+	local source_pkg
+
+	# FORK PATCH: un subpaquete (bzip2) no tiene directorio propio; se compila
+	# su padre (libbz2), que produce ambos .deb.
+	if ! source_pkg=$(resolve_package_dir "$package_name"); then
+		echo "[!] No source directory for '$package_name' (not a package nor a subpackage?)" 1>&2
+		return 1
+	fi
+	if [ "$source_pkg" != "$package_name" ]; then
+		echo "[*] '$package_name' is a subpackage of '$source_pkg'; building the parent"
+	fi
 
 	# Build package from source
 	# stderr will be redirected to stdout and both will be captured into variable and printed on screen
 	cd "$TERMUX_PACKAGES_DIRECTORY"
 	echo $'\n\n\n'"[*] Building '$package_name'..."
 	exec 99>&1
-	build_output="$("$TERMUX_PACKAGES_DIRECTORY"/build-package.sh "${BUILD_PACKAGE_OPTIONS[@]}" -a "$TERMUX_ARCH" "$package_name" 2>&1 | tee >(cat - >&99); exit ${PIPESTATUS[0]})";
+	build_output="$("$TERMUX_PACKAGES_DIRECTORY"/build-package.sh "${BUILD_PACKAGE_OPTIONS[@]}" -a "$TERMUX_ARCH" "$source_pkg" 2>&1 | tee >(cat - >&99); exit ${PIPESTATUS[0]})";
 	return_value=$?
 	echo "[*] Building '$package_name' exited with exit code $return_value"
 	exec 99>&-
