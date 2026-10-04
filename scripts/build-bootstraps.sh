@@ -283,6 +283,34 @@ add_termux_bootstrap_second_stage_files() {
 # lugar de empaquetarlo y que falle en tiempo de ejecucion, se aborta aqui.
 # Se comprueba el CONTENIDO, no solo los scripts: el bug original estaba
 # justamente en strings de ELF (.rodata), no en los ficheros de texto.
+# FORK PATCH (bootstrap propio): sustituir /data/data/com.termux por el
+# data dir de la app en todo fichero de TEXTO del rootfs.
+#
+# El prefijo de la app es mas largo que com.termux, asi que esto solo es
+# seguro en texto: en un ELF el reemplazo creceria el fichero y dejaria
+# corruptos los offsets de las secciones posteriores. Los ELF que contengan la
+# ruta se dejan intactos y los reporta validate_bootstrap_rootfs, porque
+# arreglar uno exige recompilar el paquete, no editar su binario.
+scrub_stock_text_paths() {
+	local arch="$1"
+	local root="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
+	local f n
+
+	[ -d "$root" ] || return 0
+	[ "$TERMUX_APP__DATA_DIR" = "/data/data/com.termux" ] && return 0
+
+	n=0
+	while IFS= read -r -d '' f; do
+		# -I excluye binarios; head descarta los ficheros que son puro ELF.
+		head -c 4 "$f" 2>/dev/null | grep -q $'\x7fELF' && continue
+		grep -qI '/data/data/com\.termux' "$f" 2>/dev/null || continue
+		sed -i "s|/data/data/com\.termux|${TERMUX_APP__DATA_DIR}|g" "$f" && n=$((n + 1))
+	done < <(find "$root" -type f -print0)
+
+	echo "[*] scrubbed stock paths in $n text file(s)"
+	return 0
+}
+
 validate_bootstrap_rootfs() {
 	local arch="$1"
 	local root="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
@@ -613,9 +641,10 @@ main() {
 		# Add termux bootstrap second stage files
 		add_termux_bootstrap_second_stage_files "$package_arch"
 
-		# FORK PATCH (bootstrap propio): no empaquetar un bootstrap con rutas
-		# del runtime de Termux incrustadas en ELF. Abortar aqui y no en el
-		# movil.
+		# FORK PATCH (bootstrap propio): reescribir primero, validar despues.
+		scrub_stock_text_paths "$TERMUX_ARCH" || return $?
+
+		# Abortar aqui y no en el movil si aun queda alguna ruta de Termux.
 		validate_bootstrap_rootfs "$TERMUX_ARCH" || return $?
 
 		# Create bootstrap archive.
