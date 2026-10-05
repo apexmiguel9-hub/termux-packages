@@ -297,6 +297,49 @@ add_termux_bootstrap_second_stage_files() {
 
 }
 
+# FORK PATCH (bootstrap propio): crear el layout de directorios que dpkg, apt y
+# ncurses necesitan en tiempo de ejecucion.
+#
+# El ZIP oficial de Termux los trae ya hechos porque su release se ensambla a
+# mano; nosotros montamos el rootfs solo con .deb, asi que los directorios
+# vacios no existen. dpkg falla al arrancar si no esta etc/dpkg, y apt escribe
+# en var/log/apt y var/lib/dpkg/updates.
+#
+# Contenido copiado del bootstrap oficial: los directorios van vacios a
+# proposito y solo etc/dpkg/dpkg.cfg lleva algo.
+create_runtime_directories() {
+	local arch="$1"
+	local root="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
+	local d
+
+	[ -d "$root" ] || return 0
+
+	for d in etc/apt/apt.conf.d etc/apt/preferences.d etc/dpkg etc/dpkg/dpkg.cfg.d \
+	         etc/dpkg/origins var/lib/dpkg var/lib/dpkg/info var/lib/dpkg/updates \
+	         var/log/apt var/log; do
+		mkdir -p "$root/$d"
+	done
+
+	# no-debsig: los .deb de Termux no vienen firmados, asi que con la
+	# verificacion activada dpkg los rechazaria todos.
+	# log: deja rastro en var/log/dpkg.log en vez de solo por stderr.
+	if [ ! -f "$root/etc/dpkg/dpkg.cfg" ]; then
+		cat > "$root/etc/dpkg/dpkg.cfg" <<-'EOF'
+			# dpkg configuration file
+			#
+			# Termux does not ship embedded package signatures, so debsig
+			# verification would reject every package in the archive.
+			no-debsig
+
+			# Log status changes and actions to a file.
+			log /var/log/dpkg.log
+		EOF
+	fi
+
+	echo "[*] runtime directory layout created"
+	return 0
+}
+
 # FORK PATCH (bootstrap propio): gate de validacion. Un bootstrap cuyo ELF
 # conserve /data/data/com.termux en .rodata no es reparable en el movil (el
 # string es de ancho fijo y el prefijo de la app es mas largo), asi que en
@@ -660,6 +703,11 @@ main() {
 
 		# Add termux bootstrap second stage files
 		add_termux_bootstrap_second_stage_files "$package_arch"
+
+		# FORK PATCH: layout de directorios de runtime. Va antes del scrub para
+		# que el dpkg.cfg recien creado pase tambien por la sustitucion, y antes
+		# del gate para que lo valide como cualquier otro fichero del rootfs.
+		create_runtime_directories "$TERMUX_ARCH" || return $?
 
 		# FORK PATCH (bootstrap propio): reescribir primero, validar despues.
 		scrub_stock_text_paths "$TERMUX_ARCH" || return $?
