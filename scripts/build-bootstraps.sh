@@ -465,7 +465,31 @@ create_bootstrap_archive() {
 		zip -r9 "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" ./*
 	)
 
-	mv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_PACKAGES_DIRECTORY/"
+	# FORK PATCH (bootstrap propio): destino del zip y comprobacion del mv.
+	#
+	# Antes iba a $TERMUX_PACKAGES_DIRECTORY, que es el bind-mount del repo en
+	# el host, y ahi el usuario del contenedor no puede escribir: el workspace
+	# de GitHub Actions es del uid 1001 y el contenedor corre con el uid de la
+	# imagen. Seabyte enPermission denied y, como el mv no se comprobaba,
+	# build-bootstraps.sh seguia imprimiendo "Finished successfully" y el fallo
+	# solo aparecia tres lineas mas abajo, en el ls del workflow.
+	#
+	# $TERMUX_BUILT_DEBS_DIRECTORY es /home/builder/termux-packages/output, que
+	# esta dentro del mismo bind-mount pero SI es escribible: ahi escriben los
+	# .deb durante todo el build. Ademas, de ahi se copia al workspace sin
+	# problema.
+	#
+	# Y ahora el mv se comprueba: si el zip no acaba donde debe, el build falla
+	# aqui y no 65 minutos despues en un ls.
+	mv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_BUILT_DEBS_DIRECTORY/" || {
+		echo "[!] FAIL: no se pudo escribir el zip en $TERMUX_BUILT_DEBS_DIRECTORY" 1>&2
+		return 1
+	}
+
+	if [ ! -f "${TERMUX_BUILT_DEBS_DIRECTORY}/bootstrap-${1}.zip" ]; then
+		echo "[!] FAIL: el zip no existe tras el mv" 1>&2
+		return 1
+	fi
 
 	echo "[*] Finished successfully (${1})."
 

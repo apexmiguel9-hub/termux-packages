@@ -192,7 +192,7 @@ jobs:
           ./scripts/run-docker.sh -d ./scripts/build-bootstraps.sh \
             --architectures "$ARCH" \
             --add ca-certificates,openssl,proot,python,git 2>&1 | tee bootstrap-build.log
-          ls -lh bootstrap-*.zip
+          ls -lh output/bootstrap-*.zip
 
       # Guardar DESPUES de ensamblar: si el gate falla, lo que hay en output/
       # no sirve y no debe cachearse.
