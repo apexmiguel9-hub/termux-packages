@@ -335,3 +335,65 @@ jobs:
           name: apex-bootstrap-${{ inputs.arch }}
           path: apex-bootstrap-${{ inputs.arch }}.tar.gz
           retention-days: 30
+
+  # Indexa los .deb que ya produce el job de bootstrap y los publica como
+  # repo apt. Sin esto, pkg install baja de packages-cf.termux.dev y los
+  # binarios vienen compilados para /data/data/com.termux, que no existe en
+  # nuestra app. Se comprobo en el dispositivo:
+  #
+  #   unable to stat './data/data/com.termux' (which was about to be installed)
+  #
+  # o sea que instalar cualquier paquete era imposible.
+  publish-repo:
+    needs: build-bootstrap
+    if: ${{ !inputs.audit_only && inputs.arch == 'aarch64' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          path: src
+
+      - name: Get built packages
+        uses: actions/download-artifact@v4
+        with:
+          name: apex-bootstrap-${{ inputs.arch }}
+          path: art
+
+      - name: Build the apt repo tree
+        run: |
+          set -euo pipefail
+          mkdir -p debs
+          find art -name '*.deb' -exec cp {} debs/ \;
+          N=$(ls debs | wc -l)
+          echo "debs a indexar: $N"
+          test "$N" -gt 0 || { echo "no hay debs"; exit 1; }
+          #
+          # scripts/mkarepo.sh envuelve termux-apt-repo y corrige el layout:
+          # la herramienta separa los paquetes "Architecture: all" en
+          # binary-all, pero el apt de Termux solo descarga binary-$ARCH. En el
+          # repo real de Termux no existe binary-all, asi que sin el merge esos
+          # 19 paquetes (ca-certificates, termux-keyring, termux-am...) serian
+          # invisibles para el usuario.
+          bash src/scripts/mkarepo.sh debs repo stable main "$ARCH"
+          echo "--- comprobacion ---"
+          test ! -d repo/dists/stable/main/binary-all || { echo "queda binary-all"; exit 1; }
+          grep -q '^Package: termux-keyring$' repo/dists/stable/main/binary-$ARCH/Packages \
+            || { echo "termux-keyring no esta indexado"; exit 1; }
+          echo "OK: $(grep -c '^Package: ' repo/dists/stable/main/binary-$ARCH/Packages) paquetes"
+
+      - name: Publish to gh-pages
+        run: |
+          set -euo pipefail
+          cd repo
+          git init -q .
+          git config user.name  "apex-ci"
+          git config user.email "ci@apex.local"
+          git checkout -q -b gh-pages
+          cp -r dists pool . 2>/dev/null || true
+          echo "apex-linux package repository" > README.md
+          git add -A
+          git commit -q -m "repo: $(grep -c '^Package: ' <(gzip -dc dists/stable/main/binary-aarch64/Packages.gz) 2>/dev/null || echo ?) packages"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+          echo "publicado en:"
+          echo "  deb [trusted=yes] https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ stable main"
