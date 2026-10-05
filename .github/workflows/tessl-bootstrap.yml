@@ -12,6 +12,10 @@ on:
         description: Only run the audit (no compilation)
         type: boolean
         default: false
+      reuse_built_debs:
+        description: Reuse .deb from a previous run (much faster, opt-in)
+        type: boolean
+        default: false
 
 permissions: {}
 concurrency:
@@ -122,6 +126,38 @@ jobs:
           docker save tessl/package-builder:latest | gzip > tessl-builder-image.tar
           docker buildx prune -af
 
+      # ---------------------------------------------------------------
+      # FORK PATCH: cache de .deb compilados.
+      #
+      # Compilar el closure entero son ~200 paquetes y ~80 min en un runner
+      # nuevo. kronos3D baja de ~1 h a 14-20 min cacheando sus libs
+      # precompiladas, y aqui el equivalente son los .deb ya construidos.
+      #
+      # Clave ESTRICTA a proposito: hash de todo lo que puede cambiar el
+      # binario (el sistema de build, los paquetes del fork, el workflow) mas
+      # la arch. Si algo de eso cambia, la cache se invalida sola y no se
+      # puede empaquetar un .deb de otro tree. Lo que NO entra en la clave son
+      # las fuentes upstream de los paquetes que no overrideamos, porque el
+      # closure se resuelve en runtime y no se pueden hashear aqui; para
+      # forzar la invalidacion esta el input reuse_built_debs con el sufijo
+      # manual, o basta con tocar cualquier fichero de scripts/.
+      - name: Restore compiled packages
+        if: ${{ inputs.reuse_built_debs }}
+        id: debscache
+        uses: actions/cache/restore@v4
+        with:
+          path: built-debs
+          key: >-
+            bootstrap-debs-v1-${{ env.ARCH }}-${{
+              hashFiles('scripts/**', 'packages/**', '.github/workflows/tessl-bootstrap.yml') }}
+
+      - name: Seed the container output dir from cache
+        if: ${{ inputs.reuse_built_debs }}
+        run: |
+          set -euo pipefail
+          mkdir -p built-debs
+          echo "debs en cache: $(ls built-debs 2>/dev/null | wc -l)"
+
       - name: Show the prefix we are building for
         run: |
           . scripts/properties.sh
@@ -139,10 +175,34 @@ jobs:
           # ca-certificates + openssl: sin ellos 'pkg update' no tiene TLS y
           # falla con 'None of the mirrors are accessible'. proot, python y git
           # se anaden porque el runtime los usa.
+          # Montar el directorio de salida en el host es lo que permite que
+          # los .deb sobrevivan al contenedor: sin esto se pierden al salir y
+          # la cache no serviria de nada.
+          #
+          # TODO dentro del if a proposito. El camino por defecto (sin cache)
+          # no debe montar nada ni cambiar una sola variable del entorno del
+          # build: si el montaje fallara, tiene que fallar solo cuando se pide
+          # la cache, nunca en el run que produce el artefacto de verdad.
+          if [ "${{ inputs.reuse_built_debs }}" = "true" ]; then
+            mkdir -p built-debs
+            chmod 777 built-debs
+            export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $PWD/built-debs:/home/builder/termux-packages/output"
+            export TESSL_REUSE_BUILT_DEBS=1
+          fi
           ./scripts/run-docker.sh -d ./scripts/build-bootstraps.sh \
             --architectures "$ARCH" \
             --add ca-certificates,openssl,proot,python,git 2>&1 | tee bootstrap-build.log
+          echo "debs producidos: $(ls built-debs 2>/dev/null | wc -l)"
           ls -lh bootstrap-*.zip
+
+      - name: Save compiled packages
+        if: ${{ inputs.reuse_built_debs }}
+        uses: actions/cache/save@v4
+        with:
+          path: built-debs
+          key: >-
+            bootstrap-debs-v1-${{ env.ARCH }}-${{
+              hashFiles('scripts/**', 'packages/**', '.github/workflows/tessl-bootstrap.yml') }}
 
       - name: Collect built packages
         run: |

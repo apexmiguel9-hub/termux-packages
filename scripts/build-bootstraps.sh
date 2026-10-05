@@ -116,6 +116,26 @@ build_package() {
 		echo "[*] '$package_name' is a subpackage of '$source_pkg'; building the parent"
 	fi
 
+	# FORK PATCH: reutilizar un .deb ya compilado.
+	#
+	# Compilar el closure entero son ~200 paquetes y ~80 min en un runner nuevo;
+	# con el directorio de salida persistido entre runs, un paquete cuyo .deb
+	# ya esta descargado se salta y el run baja a ~15 min, que es lo que
+	# lleva el workflow de build-native de kronos3D con sus libs precompiladas.
+	#
+	# Opt-in y con la clave de cache verificada en el workflow: reutilizar un
+	# .deb caducado empacharia el bootstrap con binarios de otro tree, que es
+	# justo lo que el gate de com.termux existe para impedir.
+	if [ "${TESSL_REUSE_BUILT_DEBS:-0}" = "1" ]; then
+		local _existing
+		for _existing in "$TERMUX_BUILT_DEBS_DIRECTORY"/*_"$TERMUX_ARCH".deb; do
+			[ -f "$_existing" ] || continue
+			case "$(basename "$_existing")" in
+				"$package_name"_*) echo "[*] Reusing cached '$_existing'"; return 0 ;;
+			esac
+		done
+	fi
+
 	# Build package from source
 	# stderr will be redirected to stdout and both will be captured into variable and printed on screen
 	cd "$TERMUX_PACKAGES_DIRECTORY"
