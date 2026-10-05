@@ -12,6 +12,10 @@ on:
         description: Only run the audit (no compilation)
         type: boolean
         default: false
+      reuse_built_debs:
+        description: Reuse .deb from a previous run (much faster)
+        type: boolean
+        default: false
 
 permissions: {}
 concurrency:
@@ -122,6 +126,48 @@ jobs:
           docker save tessl/package-builder:latest | gzip > tessl-builder-image.tar
           docker buildx prune -af
 
+      # ---------------------------------------------------------------
+      # FORK PATCH: los .deb YA viven en el host, no hace falta montar nada.
+      #
+      # run-docker.sh hace  --volume $REPOROOT:/home/builder/termux-packages
+      # y TERMUX_BUILT_DEBS_DIRECTORY es /home/builder/termux-packages/output,
+      # o sea que output/ del workspace ES el directorio de salida del
+      # contenedor. Cachearlo es cachear un path normal del repo.
+      #
+      # El montaje --volume extra que se intento antes (a
+      # /home/builder/termux-packages/output) sobra y estorba: no aportaba
+      # persistencia, solo anadia una capa con otros permisos.
+      - name: Restore compiled packages
+        if: ${{ inputs.reuse_built_debs }}
+        uses: actions/cache/restore@v4
+        with:
+          path: output
+          key: >-
+            bootstrap-debs-v1-${{ env.ARCH }}-${{
+              hashFiles('scripts/**', 'packages/**', '.github/workflows/tessl-bootstrap.yml') }}
+
+      # ---------------------------------------------------------------
+      # FORK PATCH: permission denied al escribir el zip.
+      #
+      # El contenedor corre con el uid de la imagen (1000) y el workspace de
+      # GitHub Actions es del uid 1001. create_bootstrap_archive hace
+      #
+      #     mv -f $BOOTSTRAP_TMPDIR/bootstrap-$1.zip $TERMUX_PACKAGES_DIRECTORY/
+      #
+      # y ese destino esta dentro del bind-mount, o sea en el workspace del
+      # runner: uid 1000 no puede escribir ahi.
+      #
+      # Este error salio ahora porque es el PRIMER run que llega a este paso:
+      # todos los anteriores morian en el gate, mas abajo. No es una
+      # regresion de la cache.
+      #
+      # Se abre la escritura en vez de pelear con el mapeo de uid, que en
+      # Actions exigiria sudo chown y dejaria el checkout en un uid raro.
+      - name: Make the workspace writable by the container user
+        run: |
+          sudo chown -R 1000:1000 .
+          sudo chmod -R a+rwX .
+
       - name: Show the prefix we are building for
         run: |
           . scripts/properties.sh
@@ -139,10 +185,25 @@ jobs:
           # ca-certificates + openssl: sin ellos 'pkg update' no tiene TLS y
           # falla con 'None of the mirrors are accessible'. proot, python y git
           # se anaden porque el runtime los usa.
+          if [ "${{ inputs.reuse_built_debs }}" = "true" ]; then
+            export TESSL_REUSE_BUILT_DEBS=1
+            echo "debs en cache: $(ls output 2>/dev/null | wc -l)"
+          fi
           ./scripts/run-docker.sh -d ./scripts/build-bootstraps.sh \
             --architectures "$ARCH" \
             --add ca-certificates,openssl,proot,python,git 2>&1 | tee bootstrap-build.log
           ls -lh bootstrap-*.zip
+
+      # Guardar DESPUES de ensamblar: si el gate falla, lo que hay en output/
+      # no sirve y no debe cachearse.
+      - name: Save compiled packages
+        if: ${{ inputs.reuse_built_debs }}
+        uses: actions/cache/save@v4
+        with:
+          path: output
+          key: >-
+            bootstrap-debs-v1-${{ env.ARCH }}-${{
+              hashFiles('scripts/**', 'packages/**', '.github/workflows/tessl-bootstrap.yml') }}
 
       - name: Collect built packages
         run: |
