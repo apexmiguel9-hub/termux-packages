@@ -126,14 +126,34 @@ build_package() {
 	# Opt-in y con la clave de cache verificada en el workflow: reutilizar un
 	# .deb caducado empacharia el bootstrap con binarios de otro tree, que es
 	# justo lo que el gate de com.termux existe para impedir.
+	# Reutilizar .deb solo si la version es EXACTAMENTE la que pide el arbol
+	# de fuentes actual. Antes el glob era "$package_name"_* , que acepta
+	# cualquier version: si upstream sacaba bash 1.3 y la cache tenia un
+	# bash_1.2_*.deb, se reutilizaba el viejo en silencio y el bootstrap
+	#flotando un binario de otro tree. La clave de cache tampoco ayuda
+	# aqui, porque no incluye el indice de paquetes de upstream.
+	#
+	# Si no se puede Averiguar la version, no se reutiliza: preferimos un run
+	# lento a un bootstrap con versiones mezcladas.
 	if [ "${TESSL_REUSE_BUILT_DEBS:-0}" = "1" ]; then
-		local _existing
-		for _existing in "$TERMUX_BUILT_DEBS_DIRECTORY"/*_"$TERMUX_ARCH".deb; do
-			[ -f "$_existing" ] || continue
-			case "$(basename "$_existing")" in
-				"$package_name"_*) echo "[*] Reusing cached '$_existing'"; return 0 ;;
-			esac
-		done
+		local _pkgdir _ver _existing
+		_pkgdir=$(resolve_package_dir "$package_name" || true)
+		if [ -n "$_pkgdir" ] && [ -f "$TERMUX_PACKAGES_DIRECTORY/packages/$_pkgdir/build.sh" ]; then
+			_ver=$(sed -n 's/^TERMUX_PKG_VERSION=["'\''"]\?\([^ "'\''"]*\).*/\1/p' \
+				"$TERMUX_PACKAGES_DIRECTORY/packages/$_pkgdir/build.sh" | head -1)
+			if [ -n "$_ver" ]; then
+				for _existing in "$TERMUX_BUILT_DEBS_DIRECTORY/$_pkgdir_$_ver"*_"$TERMUX_ARCH".deb; do
+					[ -f "$_existing" ] || continue
+					echo "[*] Reusing cached '$_existing' (version $_ver)"
+					return 0
+				done
+				echo "[*] no cached deb for $_pkgdir $_ver -> building"
+			else
+				echo "[*] version unknown for $_pkgdir -> building"
+			fi
+		else
+			echo "[*] no source dir for $_pkgdir -> building"
+		fi
 	fi
 
 	# Build package from source

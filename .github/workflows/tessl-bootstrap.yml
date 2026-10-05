@@ -207,10 +207,23 @@ jobs:
 
       - name: Collect built packages
         run: |
-          mkdir -p out
-          find / -name '*.deb' -path '*termux*' -newermt '-8 hours' -exec cp -n {} out/ \; 2>/dev/null || true
-          echo "debs=$(ls out/ 2>/dev/null | wc -l)"
-          ls -lh out/ | head -40
+          # Los .deb ya estan en output/ del workspace: TERMUX_BUILT_DEBS_DIRECTORY es
+          # /home/builder/termux-packages/output, que es el mismo bind-mount del repo.
+          #
+          # Antes se buscaban con find / -path '*termux*' -newermt '-8 horas' y se
+          # copiaban a out/. Eso era un bug latente:
+          #   1) si el build pasa de 8 horas, no encuentra nada
+          #   2) con TESSL_REUSE_BUILT_DEBS los .deb vienen de la cache con su mtime
+          #      original, asi que un cache hit de dias atras los descartaba en silencio
+          #   3) 'ls out/ | head -40' moria con SIGPIPE en cuanto habia mas de 40
+          #      ficheros: 'ls: write error: Broken pipe'. Era cosmetico (el codigo de
+          #      salida es el de head), pero hacia ruido en un log que ya cuesta leer.
+          NDEB=$(find output -maxdepth 1 -name '*.deb' | wc -l)
+          NZIP=$(find output -maxdepth 1 -name 'bootstrap-*.zip' | wc -l)
+          echo "debs=$NDEB  zips=$NZIP"
+          find output -maxdepth 1 -name '*.deb' -printf '  %f\n' | sort | sed -n '1,40p'
+          [ "$NDEB" -gt 40 ] && echo "  ... ($NDEB en total)"
+          ls -lh "output/bootstrap-$ARCH.zip" 2>/dev/null || echo "  zip AUSENTE"
 
       - name: Verify our prefix is baked into the compiled debs
         run: |
@@ -218,8 +231,8 @@ jobs:
           . scripts/properties.sh
           rm -rf verify && mkdir verify
           FAIL=0
-          for pkg in bash sh dpkg apt curl tar gzip coreutils; do
-            DEB=$(ls out/${pkg}_*.deb 2>/dev/null | head -1 || true)
+          for pkg in bash dash dpkg apt curl tar gzip coreutils; do
+            DEB=$(ls output/${pkg}_*.deb 2>/dev/null | head -1 || true)
             if [ -z "$DEB" ]; then echo "MISSING deb: $pkg"; FAIL=1; continue; fi
             rm -rf verify/$pkg && mkdir -p verify/$pkg
             dpkg-deb -x "$DEB" "verify/$pkg"
@@ -242,7 +255,7 @@ jobs:
         run: |
           set -euo pipefail
           . scripts/properties.sh
-          ZIP="bootstrap-$ARCH.zip"
+          ZIP="output/bootstrap-$ARCH.zip"
           test -f "$ZIP" || { echo "no $ZIP"; exit 1; }
           echo "zip: $ZIP  ($(stat -c %s "$ZIP") bytes)"
 
@@ -269,7 +282,7 @@ jobs:
           echo
           echo "=== 2) nuestro prefijo debe estar presente en los binarios criticos ==="
           MISS=0
-          for t in bash sh dpkg apt apt-get curl tar gzip clear; do
+          for t in bash dash dpkg apt apt-get curl tar gzip clear; do
             F=$(find z -type f -path "*/bin/$t" | head -1)
             if [ -z "$F" ]; then printf '  %-8s AUSENTE\n' "$t"; continue; fi
             O=$(strings -a "$F" | grep -c 'apexmiguel9' || true)
@@ -305,13 +318,13 @@ jobs:
           # and termux versions use epochs like 1:2026.09.25. Tar it instead.
           mkdir -p staged/debs
           i=0
-          for f in out/*.deb; do
+          for f in output/*.deb; do
             [ -e "$f" ] || continue
             i=$((i+1))
             safe=$(basename "$f" | tr ':' '-')
             cp "$f" "staged/debs/$safe"
           done
-          cp "bootstrap-$ARCH.zip" staged/
+          cp "output/bootstrap-$ARCH.zip" staged/
           cp bootstrap-build.log staged/ 2>/dev/null || true
           tar -czf "apex-bootstrap-$ARCH.tar.gz" -C staged .
           ls -lh "apex-bootstrap-$ARCH.tar.gz"
