@@ -348,6 +348,10 @@ jobs:
     needs: build-bootstrap
     if: ${{ !inputs.audit_only && inputs.arch == 'aarch64' }}
     runs-on: ubuntu-latest
+    # El workflow declara "permissions: {}" a nivel de raiz, asi que sin esto
+    # el push a gh-pages no tiene permisos y falla con "not authorized".
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -363,11 +367,21 @@ jobs:
       - name: Build the apt repo tree
         run: |
           set -euo pipefail
-          mkdir -p debs
-          find art -name '*.deb' -exec cp {} debs/ \;
+          # El artefacto es un tarball (Pack artifact), no .deb sueltos: hay que
+          # desempaquetarlo primero. Sin esto "find art -name '*.deb'" no
+          # encuentra nada y el job muere con "debs a indexar: 0".
+          echo "--- contenido del artefacto ---"
+          ls -l art
+          TARBALL=$(find art -maxdepth 1 -name '*.tar.gz' | head -1)
+          test -n "$TARBALL" || { echo "no hay tarball"; exit 1; }
+          mkdir -p debs unpacked
+          tar -xzf "$TARBALL" -C unpacked
+          echo "--- dentro del tarball ---"
+          find unpacked -maxdepth 2 -type d | head -5
+          find unpacked -name '*.deb' -exec cp {} debs/ \;
           N=$(ls debs | wc -l)
           echo "debs a indexar: $N"
-          test "$N" -gt 0 || { echo "no hay debs"; exit 1; }
+          test "$N" -gt 0 || { echo "no hay debs tras desempaquetar"; exit 1; }
           #
           # scripts/mkarepo.sh envuelve termux-apt-repo y corrige el layout:
           # la herramienta separa los paquetes "Architecture: all" en
@@ -386,14 +400,17 @@ jobs:
         run: |
           set -euo pipefail
           cd repo
+          DIST_NAME=stable; ARCH_NAME=aarch64
           git init -q .
           git config user.name  "apex-ci"
           git config user.email "ci@apex.local"
           git checkout -q -b gh-pages
-          cp -r dists pool . 2>/dev/null || true
-          echo "apex-linux package repository" > README.md
+          # Los .deb viven dentro de dists/, que es como los publica
+          # termux-apt-repo y como los resuelve apt via el campo Filename.
+          echo "apex-linux package repository (aarch64)" > README.md
           git add -A
-          git commit -q -m "repo: $(grep -c '^Package: ' <(gzip -dc dists/stable/main/binary-aarch64/Packages.gz) 2>/dev/null || echo ?) packages"
+          PKGS=$(grep -c '^Package: ' "dists/$DIST_NAME/main/binary-$ARCH_NAME/Packages" || echo 0)
+          git commit -q -m "repo: $PKGS packages para aarch64"
           git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
           echo "publicado en:"
           echo "  deb [trusted=yes] https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ stable main"
